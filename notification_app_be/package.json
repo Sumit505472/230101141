@@ -1,0 +1,17 @@
+{
+  "name": "notification_app_be",
+  "version": "1.0.0",
+  "description": "Backend application for notification system",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
