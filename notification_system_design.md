@@ -854,3 +854,246 @@ The best practical design is:
 - database indexes are added only for real query patterns
 
 This reduces database load, improves page speed, and still keeps the system reliable because the SQL database remains the final source of truth.
+
+# Stage 5
+
+## Review of Proposed Notify All Implementation
+
+Proposed pseudocode:
+
+```text
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+This approach is simple, but it is not safe for 50,000 students.
+
+The biggest issue is that everything happens inside one direct loop. If the Email API becomes slow, the whole process becomes slow. If the process crashes at student number `23,000`, then some students get the notification and others do not. It is also hard to retry only failed emails or failed app pushes.
+
+It also puts sudden pressure on external email services, the database, and the real-time notification server at the same time.
+
+## Problems With This Approach
+
+- The HR request may timeout before all 50,000 students are processed
+- Email API rate limits may be hit
+- One failure can stop the whole operation
+- There is no clean retry mechanism
+- Database inserts happen one by one, which is slow
+- Real-time pushes may overload the WebSocket server
+- It is difficult to know how many notifications were sent, failed, or are still pending
+- Duplicate notifications may be created if HR clicks the button twice
+
+## Better Design
+
+The HR action should create one notification campaign/job, then background workers should process it in batches.
+
+Flow:
+
+```text
+HR clicks Notify All
+        |
+        v
+Create notification_campaign record
+        |
+        v
+Insert in-app notifications in batches
+        |
+        v
+Push email jobs to queue
+        |
+        v
+Workers send emails with retry and rate limiting
+        |
+        v
+WebSocket service pushes in-app events to online students
+```
+
+The API should return quickly after creating the campaign:
+
+```json
+{
+  "success": true,
+  "message": "Notification campaign started",
+  "data": {
+    "campaignId": "campaign_2026_placement_01",
+    "targetCount": 50000,
+    "status": "processing"
+  }
+}
+```
+
+## Suggested Pseudocode
+
+```text
+function notify_all(student_ids, message):
+    campaign_id = create_campaign(message, total_students=len(student_ids))
+
+    for batch in split(student_ids, 1000):
+        bulk_insert_notifications(campaign_id, batch, message)
+        enqueue_email_jobs(campaign_id, batch, message)
+        enqueue_realtime_push_jobs(campaign_id, batch, message)
+
+    return campaign_id
+```
+
+Workers then process the queue:
+
+```text
+function email_worker(job):
+    try:
+        send_email(job.student_id, job.message)
+        mark_email_sent(job.notification_id)
+    catch error:
+        retry_with_backoff(job)
+
+function realtime_worker(job):
+    if student_is_online(job.student_id):
+        push_to_app(job.student_id, job.message)
+    mark_in_app_created(job.notification_id)
+```
+
+## Database Tables
+
+```sql
+CREATE TABLE notification_campaigns (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_by UUID NOT NULL,
+  title VARCHAR(150) NOT NULL,
+  message TEXT NOT NULL,
+  notification_type notification_type NOT NULL,
+  target_count INT NOT NULL,
+  status VARCHAR(30) NOT NULL DEFAULT 'processing',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at TIMESTAMP NULL
+);
+
+CREATE TABLE notification_delivery_status (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  notification_id UUID NOT NULL REFERENCES notifications(id),
+  student_id UUID NOT NULL,
+  campaign_id UUID NOT NULL REFERENCES notification_campaigns(id),
+  email_status VARCHAR(30) NOT NULL DEFAULT 'pending',
+  app_status VARCHAR(30) NOT NULL DEFAULT 'pending',
+  email_attempts INT NOT NULL DEFAULT 0,
+  last_error TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (campaign_id, student_id)
+);
+```
+
+The unique constraint on `(campaign_id, student_id)` prevents duplicate notifications for the same campaign if the HR clicks twice or if a retry runs again.
+
+## Batch Insert for In-App Notifications
+
+Instead of 50,000 separate inserts, insert in batches.
+
+Example:
+
+```sql
+INSERT INTO notifications (
+  studentID,
+  notificationType,
+  title,
+  message,
+  isRead,
+  createdAt
+)
+SELECT
+  s.studentID,
+  'Placement',
+  'Placement notification',
+  'A new placement announcement has been published.',
+  false,
+  NOW()
+FROM students s
+WHERE s.isActive = true;
+```
+
+If the system must target a selected list of students, pass the selected student ids through a temporary table or array and insert from that list.
+
+## Queue and Worker Strategy
+
+Use a queue such as BullMQ, RabbitMQ, Kafka, or AWS SQS.
+
+Email jobs should be rate limited. For example, if the Email API allows `500` emails per minute, workers should respect that limit instead of sending all 50,000 immediately.
+
+Recommended job fields:
+
+```json
+{
+  "campaignId": "campaign_2026_placement_01",
+  "notificationId": "notif_101",
+  "studentId": "student_1042",
+  "email": "student@example.com",
+  "message": "A new placement announcement has been published.",
+  "attempt": 1
+}
+```
+
+## Real-Time Notification Handling
+
+For in-app notifications, the database insert should be the source of truth. WebSocket push should be treated as delivery optimization.
+
+If the student is online:
+
+```json
+{
+  "event": "notification.created",
+  "data": {
+    "notificationId": "notif_101",
+    "notificationType": "Placement",
+    "title": "Placement notification",
+    "message": "A new placement announcement has been published."
+  }
+}
+```
+
+If the student is offline, nothing is lost because the notification is already saved in the database. The student will see it on the next login or notification fetch.
+
+## Failure Handling
+
+The system should not fail the whole campaign because one email failed.
+
+Use:
+
+- retries with exponential backoff
+- dead-letter queue for permanently failed jobs
+- status table to track pending, sent, failed, and retried deliveries
+- idempotency key using `campaignId + studentId`
+- admin campaign status screen for HR
+
+Example statuses:
+
+```text
+pending
+processing
+sent
+failed
+retrying
+```
+
+## Tradeoffs
+
+Batch processing is more complex than a direct loop, but it is much safer. It gives retry, monitoring, and predictable load on the database and Email API.
+
+Real-time push gives a better user experience, but it should not be the only delivery method. WebSocket connections can drop. Saving the notification first makes the system reliable even when the student is offline.
+
+Queues add infrastructure, but they protect the main API from timeout and protect external services from sudden traffic spikes.
+
+## Final Recommendation
+
+For 50,000 students, I would use this approach:
+
+- create a campaign record immediately
+- insert notifications in database batches
+- send emails through a queue with rate limiting
+- push in-app notifications through WebSocket only for online users
+- track delivery status per student
+- retry failures in background
+- prevent duplicates with an idempotency key or unique constraint
+
+This design is slower than a direct loop in terms of total background processing time, but it is much more reliable and will not freeze the HR request or overload the database.
